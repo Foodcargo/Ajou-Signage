@@ -10,31 +10,66 @@
 
 **공간 데이터 → 3D 탐색 → 예약 → 사용 현황 조회**를 하나의 사용자 흐름으로 연결했습니다. 아래는 이 저장소의 **프런트엔드 구현**을 기준으로 정리한 구성도입니다.
 
-~~~mermaid
-flowchart TD
-    USER["사용자 · 전자칠판 · 모바일"] --> APP["App / useDeviceType<br/>화면 크기에 따른 UI 분기"]
-    subgraph UI["React + TypeScript"]
-        APP --> DESKTOP["데스크톱 3D 탐색<br/>BuildingViewer / FloorViewer"]
-        APP --> DASH["모바일·태블릿 현황<br/>ClassroomManagement"]
-        DESKTOP --> BOOK["예약 입력·조회·수정<br/>RoomReservationModal / ReservationForm"]
-        DASH --> BOOK
-        SPACE["건물·층·강의실 데이터<br/>Building / Floor / Room"] --> DESKTOP
-        SPACE --> STATUS["화면별 상태 계산<br/>RoomComponent / classroomData"]
-        STATUS --> DESKTOP
-        STATUS --> DASH
-    end
-    BOOK --> DB["예약·강의 저장소 모듈<br/>reservationDB / lectureDB"]
-    DB --> IDB[("IndexedDB<br/>브라우저 내 예약·강의 데이터")]
-    DB --> STATUS
-    TIME["timeService<br/>외부 시간 API · 캐시 · 로컬 대체"] --> STATUS
-    BOOK -. "Passkey 선택 시" .-> AUTH["passkeyAuth<br/>WebAuthn 호출"]
-    AUTH --> DEVICE["브라우저·기기 인증기"]
-    AUTH --> LOCAL[("localStorage<br/>사용자 메타데이터·세션")]
-    classDef view fill:#e8f1ff,stroke:#4973a5,color:#172b4d;
-    classDef data fill:#e7f6ee,stroke:#3e8463,color:#173a2b;
-    class APP,DESKTOP,DASH,BOOK view;
-    class SPACE,DB,IDB,TIME,LOCAL data;
-~~~
+```text
+[사용자 / 전자칠판 / 모바일 브라우저]
+                  |
+                  v
+              main.tsx
+       예약·강의 IndexedDB 초기화
+                  |
+                  v
+          App.tsx + useDeviceType
+                  |
+          +-------+------------------------------+
+          |                                      |
+          v                                      v
+  [Desktop: 1024px 이상]               [Mobile / Tablet: 1024px 미만]
+  BuildingViewer                      ClassroomManagement
+          |                                      |
+          +-- 전체 건물 표시                     +-- 검색·건물·층·상태 필터
+          +-- FloorViewer: 선택한 층              +-- StatusView: 사용 현황
+          +-- RoomComponent: 방 메시·상태 색상    +-- ScheduleView: 시간표
+          |                                      +-- ReservationView: 예약 관리
+          v                                      |
+  RoomReservationModal                           v
+          |                               ReservationForm
+          +------------------+-------------------+
+                             |
+                             v
+                  reservationDB.ts
+                충돌 조회 / 예약 CRUD
+                             |
+                             v
+                   [브라우저 IndexedDB]
+                 예약: RoomReservationDB
+                 강의: LectureDB
+```
+
+**데이터와 보조 기능의 연결**
+
+```text
+공간 정의: types/building.ts + data/{seong,paldal,dasan}Data.ts
+    +--> BuildingViewer / FloorViewer / RoomComponent: 3D 배치
+    +--> classroomData.ts: 현황 목록 생성
+
+예약·강의: reservationDB.ts / lectureDB.ts --> IndexedDB
+    +--> RoomComponent.tsx: 3D 방의 사용 상태 계산
+    +--> classroomData.ts: 목록 상태·다음 일정 계산
+    +--> scheduleData.ts: 날짜별 시간표 구성
+
+시간: 외부 시간 API --> timeService.ts --> 상태·일정 계산
+                         +-- 캐시 / 실패 시 로컬 시간 대체
+
+변경 알림: 예약 폼·관리 화면 --> eventBus.ts
+                                  +--> 구독 중인 예약·시간표 화면 재조회
+
+인증: 인증 UI --> passkeyAuth.ts --> WebAuthn / 기기 인증기
+                       +----------> localStorage: 사용자 정보·세션
+
+배포: Docker(Node + Vite 빌드) --> 정적 파일 --> Nginx --> 브라우저
+```
+
+화살표는 호출·데이터 전달 관계를 요약합니다. 3D 화면과 목록 화면의 상태 계산은 **현재 서로 다른 코드 경로**이며, 위 그림에서 하나의 공통 계산 서비스로 합쳐 표현하지 않았습니다.
 
 **배포 구성:** Docker의 Node 빌드 단계에서 정적 파일을 생성하고, Nginx가 SPA를 제공하도록 구성했습니다. 현재 저장소에는 예약 서버 API와 중앙 데이터베이스 연결 구현이 포함되어 있지 않습니다. 기존 소개에 기재된 **FastAPI·SQLAlchemy·PostgreSQL은 이 코드의 실행 구성으로 확인되지 않아 위 다이어그램에서 제외**했습니다.
 
@@ -114,23 +149,118 @@ AJOU SIGNAGE는 기존 대학 포털의 여러 조회 단계를 **공간 탐색 
 | 화면 갱신 | React state·effect, 이벤트 버스, 주기 조회 |
 | 컨테이너 구성 | Docker 다단계 빌드, Nginx 정적 파일 제공 |
 
-## 코드 탐색
+## 디렉토리 구조와 역할
 
-~~~text
-src/
-├── App.tsx                   # 기기별 화면 분기 및 선택한 층 상태
-├── components/
-│   ├── desktop/              # 전체 건물·층별 3D 뷰
-│   ├── mobile/, tablet/      # 기기별 탐색·표시 컴포넌트
-│   ├── common/               # 현황·예약·시간표·설정 화면
-│   ├── reservation/          # 예약 폼과 목록
-│   └── RoomComponent.tsx     # 방 형상, 표시 색상, 클릭 처리
-├── pages/                    # 강의실 관리 화면 및 필터 상태
-├── data/                     # 공간 데이터와 현황 데이터 조합
-├── types/                    # 건물·강의실·예약·강의·인증 타입
-├── hooks/                    # 기기 유형 판별
-└── utils/                    # 저장소·시간·인증·이벤트 유틸리티
-~~~
+아래는 실제 파일을 확인해 정리한 주요 디렉토리입니다. 의존성·빌드 산출물·편집기 이력과 일부 보조 파일은 생략했습니다.
+
+```text
+Ajou-Signage/
+├── src/                              # 애플리케이션 소스
+│   ├── main.tsx                      # DB 초기화 후 React 렌더링
+│   ├── App.tsx                       # 기기별 화면 분기·선택한 층 상태
+│   ├── App.css / index.css           # 앱·전역 스타일
+│   │
+│   ├── components/                   # 화면과 상호작용 컴포넌트
+│   │   ├── desktop/
+│   │   │   ├── BuildingViewer.tsx     # 건물 전체 3D 탐색·예약 연결
+│   │   │   └── FloorViewer.tsx        # 선택한 층의 3D 탐색
+│   │   ├── mobile/                   # 모바일 헤더·하단 메뉴·카드·통계
+│   │   ├── tablet/                   # 태블릿 하단 메뉴·콘텐츠 컴포넌트
+│   │   ├── common/
+│   │   │   ├── StatusView.tsx         # 강의실 현황과 상세 화면 연결
+│   │   │   ├── ScheduleView.tsx       # 시간표 조회·예약 폼 연결
+│   │   │   ├── ReservationView.tsx    # 예약 목록·수정·삭제
+│   │   │   ├── SettingsView.tsx       # 설정·사용자 정보
+│   │   │   ├── Sidebar.tsx           # 건물·층·상태 필터 UI
+│   │   │   └── Layout.tsx            # 현재 내용이 없는 파일
+│   │   ├── reservation/
+│   │   │   ├── ReservationForm.tsx    # IndexedDB 기반 예약 입력
+│   │   │   └── ReservationList.tsx    # 별도 메모리 예약 모델을 참조하는 목록
+│   │   ├── RoomComponent.tsx          # 방 형상·상태 색상·클릭 처리
+│   │   ├── RoomReservationModal.tsx   # 3D 화면에서 사용하는 예약 모달
+│   │   ├── PasskeyRegistrationModal.tsx
+│   │   ├── QuickAuthModal.tsx         # 인증 관련 화면
+│   │   └── AppHeader.tsx / Footer.tsx # 앱 헤더·층 선택 메뉴
+│   │
+│   ├── pages/
+│   │   └── ClassroomManagement.tsx   # 모바일·태블릿 탭·필터·조회 상태 관리
+│   ├── hooks/
+│   │   └── useDeviceType.ts          # 화면 너비에 따른 기기 유형 판별
+│   │
+│   ├── data/
+│   │   ├── seongData.ts              # 성호관 공간·형상 정의
+│   │   ├── paldalData.ts             # 팔달관 공간·형상 정의
+│   │   ├── dasanData.ts              # 다산관 공간·형상 정의
+│   │   ├── buildingData.ts           # 건물 목록·이름 매핑
+│   │   ├── classroomData.ts          # 예약·강의를 조합한 현황 계산·캐시
+│   │   ├── scheduleData.ts           # 시간 슬롯·날짜별 일정 생성
+│   │   └── reservationData.ts        # 메모리 배열 기반 별도 예약 구현
+│   │
+│   ├── types/
+│   │   ├── building.ts               # Building·Floor·Room·저장소 예약 타입
+│   │   ├── reservation.ts            # classroomId/startTime 기반 별도 예약 타입
+│   │   ├── classroom.ts              # 현황 카드·통계 타입
+│   │   ├── schedule.ts               # 시간 슬롯·일정 타입
+│   │   ├── Lecture.ts                # 정규 강의 타입
+│   │   └── auth.ts                   # 사용자·세션·QR 인증 타입
+│   │
+│   ├── utils/
+│   │   ├── reservationDB.ts          # 예약 IndexedDB 접근·시간 충돌 조회
+│   │   ├── lectureDB.ts              # 강의 IndexedDB 접근·샘플 초기화
+│   │   ├── timeService.ts            # 외부 시간 조회·캐시·대체 처리
+│   │   ├── timeFormat.ts             # 날짜 문자열 변환
+│   │   ├── passkeyAuth.ts            # WebAuthn 호출·브라우저 세션 관리
+│   │   ├── qrCode.ts                 # QR 데이터 생성·파싱
+│   │   └── eventBus.ts               # 화면 간 이벤트 발행·구독
+│   ├── styles/                       # common·desktop·mobile·tablet 스타일
+│   └── assets/                       # 소스에서 사용할 정적 자원
+│
+├── public/                           # 배경 이미지 등 정적 제공 파일
+├── images/                           # README 시연 이미지
+├── pdf_files/                        # 발표 자료
+├── index.html                        # Vite 앱 진입 HTML
+├── demo.html                         # 별도 데모 HTML
+├── package.json / package-lock.json  # 스크립트·의존성과 버전 잠금
+├── vite.config.ts                    # 개발 서버·번들러 설정
+├── tsconfig*.json / eslint.config.js # TypeScript·정적 검사 설정
+├── Dockerfile / docker-compose.yml   # 정적 앱 컨테이너 구성
+├── nginx.conf                        # 정적 파일·SPA 제공 설정
+├── PASSKEY_SETUP.md                  # Passkey 설정 안내
+└── README.md / README.docker.md       # 프로젝트·실행 문서
+```
+
+### 디렉토리를 읽는 방법
+
+| 영역 | 현재 책임 | 구조 분석 |
+| --- | --- | --- |
+| <code>pages/</code> | 페이지 수준 상태와 여러 화면의 조합 | 필터·탭·조회 상태의 중심이 명확함. 조회 로직은 전용 훅으로 분리할 여지가 있음 |
+| <code>components/</code> | 렌더링과 사용자 상호작용 | 기기별 분리와 기능별 분리를 함께 사용함. <code>common/</code>은 단순 공통 UI뿐 아니라 예약·시간표 기능도 포함 |
+| <code>data/</code> | 공간 상수, 상태·일정 계산, 별도 예약 배열 | 정적 데이터와 업무 로직이 섞여 있음. 공간 정의와 계산 함수를 분리하면 탐색하기 쉬움 |
+| <code>types/</code> | 데이터 계약 | 방 형상 타입 구분은 명확함. 예약 타입은 두 종류이므로 표준 모델로 통합할 필요가 있음 |
+| <code>utils/</code> | 저장소·시간·인증·이벤트 | 화면에서 공통 기능을 분리한 점은 좋음. 저장소와 서비스의 역할을 폴더로 더 구분할 수 있음 |
+| <code>styles/</code> | 공통·기기별 스타일 | 화면 컴포넌트의 기기 구분과 대응하므로 관련 스타일을 찾기 쉬움 |
+
+### 예약 데이터 경로가 두 종류인 점
+
+```text
+현재 주요 예약 입력·조회 경로
+  ReservationForm / RoomReservationModal / ReservationView
+       --> utils/reservationDB.ts
+       --> IndexedDB
+       --> types/building.ts의 Reservation
+           (roomId, time, duration)
+
+별도 예약 모델을 참조하는 컴포넌트 코드
+  MobileClassroomCard / ReservationList
+       --> data/reservationData.ts
+       --> 메모리 배열
+       --> types/reservation.ts의 Reservation
+           (classroomId, startTime, endTime)
+```
+
+두 경로는 저장 위치와 데이터 형식이 다릅니다. 두 번째 경로의 컴포넌트가 현재 메인 화면에 모두 연결되어 있다는 뜻은 아니며, **파일의 import 관계에서 확인한 별도 구현**입니다. 기능 확장 시 예약 모델과 저장소 접근을 한 경로로 정리하면 화면 간 불일치를 줄일 수 있습니다.
+
+**전체 구조 판단:** 역할별 폴더 구분은 되어 있지만 엄격한 계층형 구조는 아닙니다. 화면에서 저장소를 직접 호출하고 <code>data/</code>에서도 업무 계산을 수행하는 형태입니다. 기존 폴더 구성을 유지하면서 상태 계산·예약 모델·저장소 접근을 공통화하는 방향이 적합합니다.
 
 ## 실행 방법
 
